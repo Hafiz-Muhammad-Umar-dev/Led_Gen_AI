@@ -293,7 +293,7 @@ def init_db():
                 gmail_sender=os.getenv("GMAIL_SENDER", ""),
                 gmail_app_password=os.getenv("GMAIL_APP_PASSWORD", ""),
                 groq_api_key=os.getenv("GROQ_API_KEY", ""),
-                maps_api_key=os.getenv("GOOGLE_MAPS_API_KEY", ""),
+                maps_api_key=os.getenv("GEOAPIFY_API_KEY", ""),
                 schedule_days=4,
                 email_template="",
                 company_name="Industronics",

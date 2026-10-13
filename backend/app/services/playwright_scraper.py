@@ -1,199 +1,400 @@
+### 1. Replace `backend/app/services/playwright_scraper.py`
+
 """
-Google Maps scraper using the official Places API (Text Search + Place Details).
-Exposed as a generator so the SSE route can stream results in real-time.
-
-Drop-in replacement for scrape_playwright_stream() — same typed-dict contract:
+Geoapify-based business lead scraper.
+Preserves the existing SSE generator contract:
   {"_type": "progress", "message": "..."}
-  {"_type": "lead",     "name": "...", "maps_url": "...", ...}
-  {"_type": "error",    "name": "...", "message": "..."}
-
-Advantages over the Playwright version:
-  - No DOM scraping / CSS selectors to break when Google changes markup.
-  - No bot-detection risk, no headless browser to launch/maintain.
-  - Returns structured JSON directly (name, phone, address, website, rating,
-    types) instead of parsing rendered HTML.
-  - No missed/dropped listings from scroll-timing or lazy-load races.
-
-Tradeoffs to be aware of:
-  - Costs money per request (Text Search + one Details call per result).
-  - Requires a valid Google Maps Places API key with billing enabled.
-  - Detail fields are capped by whatever you list in DETAIL_FIELDS (each
-    additional field can affect the SKU/cost tier — see Places API pricing).
-  - No "maps_url" from Google directly; one is reconstructed from place_id.
+  {"_type": "lead", ...}
+  {"_type": "error", "name": "", "message": "..."}
 """
 
 import logging
+import re
 import time
+from urllib.parse import quote_plus
 
 import requests
 
 logger = logging.getLogger(__name__)
 
-TEXT_SEARCH_URL    = "https://maps.googleapis.com/maps/api/place/textsearch/json"
-PLACE_DETAILS_URL  = "https://maps.googleapis.com/maps/api/place/details/json"
-DETAIL_FIELDS      = "name,formatted_phone_number,formatted_address,website,rating,types,url"
-MAX_PAGES          = 2
-DETAIL_SLEEP_SEC    = 1     # stay within per-second rate limits
-NEXT_PAGE_SLEEP_SEC = 2     # Google requires a short delay before page tokens activate
+GEOCODING_URL = "https://api.geoapify.com/v1/geocode/search"
+PLACES_URL = "https://api.geoapify.com/v2/places"
+
+TIMEOUT = 20
+MAX_RADIUS_METERS = 30000
+
+# Geoapify categories are broader than a free-text Google Maps search.
+CATEGORY_MAP = {
+    "travel": ["office", "commercial", "tourism"],
+    "hotel": ["accommodation"],
+    "restaurant": ["catering"],
+    "cafe": ["catering"],
+    "dentist": ["healthcare"],
+    "doctor": ["healthcare"],
+    "hospital": ["healthcare"],
+    "real estate": ["office", "commercial"],
+    "school": ["education"],
+    "shop": ["commercial"],
+    "agency": ["office", "commercial"],
+}
+
+# Terms used to match results to the requested business type.
+MATCH_TERMS = {
+    "travel": [
+        "travel", "tour", "tours", "tourism",
+        "travel_agent", "travel agency", "visa",
+    ],
+    "hotel": ["hotel", "motel", "guest_house", "hostel"],
+    "restaurant": ["restaurant", "catering.restaurant"],
+    "cafe": ["cafe", "coffee"],
+    "dentist": ["dentist", "healthcare.dentist"],
+    "doctor": ["doctor", "physician", "healthcare"],
+    "hospital": ["hospital"],
+    "real estate": ["estate_agent", "real estate", "property"],
+    "school": ["school", "education"],
+    "shop": ["shop", "commercial"],
+    "agency": ["agency", "office"],
+}
 
 
-def scrape_official_stream(query: str, max_results: int = 20, api_key: str = ""):
+def _parse_query(query: str):
+    """Split a query such as 'travel agency in Karachi' into type and city."""
+    cleaned = query.strip()
+    lower = cleaned.lower()
+
+    location = None
+    business_type = lower
+
+    match = re.search(r"\bin\s+(.+)$", cleaned, flags=re.IGNORECASE)
+    if match:
+        location = match.group(1).strip()
+        business_type = cleaned[:match.start()].strip().lower()
+    else:
+        # Support queries such as 'travel agency Karachi'.
+        known_types = sorted(
+            set(CATEGORY_MAP.keys()),
+            key=len,
+            reverse=True,
+        )
+        for term in known_types:
+            if lower.startswith(term):
+                location = cleaned[len(term):].strip()
+                business_type = term
+                break
+
+    if location:
+        location = re.sub(r"\s+", " ", location).strip(" ,")
+        if "pakistan" not in location.lower():
+            location += ", Pakistan"
+
+    if not business_type:
+        business_type = lower
+
+    categories = ["commercial", "office"]
+    match_terms = []
+
+    for term, cats in CATEGORY_MAP.items():
+        if term in business_type:
+            categories = cats
+            match_terms = MATCH_TERMS.get(term, [term])
+            break
+
+    # Remove generic words from matching terms.
+    if not match_terms:
+        match_terms = [
+            word for word in business_type.split()
+            if word not in {"in", "near", "the", "and"}
+        ]
+
+    return business_type, location, categories, match_terms
+
+
+def _geocode_location(location: str, api_key: str):
+    """Resolve a city/location to coordinates using Geoapify Geocoding."""
+    response = requests.get(
+        GEOCODING_URL,
+        params={
+            "text": location,
+            "format": "json",
+            "limit": 1,
+            "apiKey": api_key,
+        },
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    results = data.get("results") or []
+    if not results:
+        raise RuntimeError(
+            f"Could not locate '{location}'. Try a clearer city name."
+        )
+
+    result = results[0]
+    return float(result["lon"]), float(result["lat"])
+
+
+def _fetch_places(
+    categories: list[str],
+    lon: float,
+    lat: float,
+    api_key: str,
+    limit: int,
+):
+    """Fetch places within a radius using Geoapify Places API."""
+    response = requests.get(
+        PLACES_URL,
+        params={
+            "categories": ",".join(categories),
+            "filter": f"circle:{lon},{lat},{MAX_RADIUS_METERS}",
+            "bias": f"proximity:{lon},{lat}",
+            "limit": min(max(limit, 1), 100),
+            "lang": "en",
+            "apiKey": api_key,
+        },
+        timeout=TIMEOUT,
+    )
+    response.raise_for_status()
+    data = response.json()
+
+    if data.get("error"):
+        raise RuntimeError(data.get("message") or data["error"])
+
+    return data.get("features", [])
+
+
+def _raw_properties(properties: dict) -> dict:
+    datasource = properties.get("datasource") or {}
+    raw = datasource.get("raw") or {}
+    return raw if isinstance(raw, dict) else {}
+
+
+def _get_contact(properties: dict, raw: dict, *keys):
+    """Find the first available contact value."""
+    contact = properties.get("contact") or {}
+
+    for key in keys:
+        value = properties.get(key)
+        if value:
+            return value
+
+        value = contact.get(key)
+        if value:
+            return value
+
+        value = raw.get(key)
+        if value:
+            return value
+
+        # OpenStreetMap often uses contact:phone / contact:website.
+        value = raw.get(f"contact:{key}")
+        if value:
+            return value
+
+    return None
+
+
+def _format_category(categories) -> str:
+    if not isinstance(categories, list):
+        return ""
+
+    return ", ".join(
+        str(category).replace("_", " ").replace(".", " ").title()
+        for category in categories[:5]
+    )
+
+
+def _matches_query(properties: dict, raw: dict, match_terms: list[str]) -> bool:
+    """Avoid returning unrelated places from broad parent categories."""
+    if not match_terms:
+        return True
+
+    name = str(properties.get("name") or "").lower()
+    categories = " ".join(properties.get("categories") or []).lower()
+    raw_tags = " ".join(
+        str(value) for value in raw.values()
+        if isinstance(value, (str, int, float))
+    ).lower()
+
+    searchable = f"{name} {categories} {raw_tags}"
+
+    return any(term.lower() in searchable for term in match_terms)
+
+
+def scrape_official_stream(
+    query: str,
+    max_results: int = 20,
+    api_key: str = "",
+):
     """
-    Generator — calls the Google Maps Places API and yields typed dicts,
-    matching the same shape scrape_playwright_stream() produces.
-
-    `query` works exactly like it did for the Playwright version — pass the
-    full search string (e.g. "coffee shops in Austin").
+    Search businesses using Geoapify.
+    The api_key argument is retained for compatibility with the existing route.
     """
     if not api_key:
-        msg = "Google Maps API key is missing"
-        print(f"[maps_scraper_official] ERROR: {msg}")
-        logger.error(msg)
-        yield {"_type": "error", "name": "", "message": msg}
+        message = (
+            "Geoapify API key is missing. Set GEOAPIFY_API_KEY in backend .env."
+        )
+        logger.error(message)
+        yield {"_type": "error", "name": "", "message": message}
         return
-
-    yield {"_type": "progress", "message": f"Searching Google Maps for '{query}'…"}
 
     try:
-        listings = _text_search(query, api_key, max_results)
-    except Exception as exc:
-        print(f"[maps_scraper_official] Text search failed: {exc}")
-        logger.error("Text search failed: %s", exc)
-        yield {"_type": "error", "name": "", "message": str(exc)}
-        return
+        business_type, location, categories, match_terms = _parse_query(query)
 
-    yield {"_type": "progress", "message": f"Found {len(listings)} listings — fetching details…"}
+        if not location:
+            message = (
+                "Please include a city in the search, for example "
+                "'travel agency in Karachi'."
+            )
+            yield {"_type": "error", "name": "", "message": message}
+            return
 
-    for i, listing in enumerate(listings, 1):
-        yield {"_type": "progress", "message": f"({i}/{len(listings)}) {listing['name']}"}
+        yield {
+            "_type": "progress",
+            "message": f"Locating {location}...",
+        }
 
-        # Individual detail calls occasionally fail (transient network blip,
-        # momentary API hiccup) — retry once before giving up, so a single
-        # flaky request doesn't drop the lead entirely.
-        last_exc = None
-        for attempt in range(2):
-            try:
-                details = _fetch_detail(listing["place_id"], api_key)
-                yield {"_type": "lead", **listing, **details}
-                last_exc = None
+        lon, lat = _geocode_location(location, api_key)
+
+        yield {
+            "_type": "progress",
+            "message": f"Searching Geoapify for {business_type} in {location}...",
+        }
+
+        features = _fetch_places(
+            categories=categories,
+            lon=lon,
+            lat=lat,
+            api_key=api_key,
+            limit=max_results,
+        )
+
+        added = 0
+
+        for feature in features:
+            if added >= max_results:
                 break
-            except Exception as exc:
-                last_exc = exc
-                if attempt == 0:
-                    time.sleep(3)
-        if last_exc is not None:
-            yield {"_type": "error", "name": listing.get("name", ""), "message": str(last_exc)}
 
-        time.sleep(DETAIL_SLEEP_SEC)
+            properties = feature.get("properties") or {}
+            raw = _raw_properties(properties)
 
-    print(f"[maps_scraper_official] Stream complete for '{query}'")
+            name = (
+                properties.get("name")
+                or properties.get("address_line1")
+                or ""
+            ).strip()
 
-
-# Backwards-compatible alias — keeps existing imports working unchanged:
-#   from app.services.playwright_scraper import scrape_playwright_stream
-# Every call site still works; the only behavior change is that this
-# generator now needs an `api_key` kwarg (see dashboard note below).
-scrape_playwright_stream = scrape_official_stream
-
-
-# ---------------------------------------------------------------------------
-# Internal helpers
-# ---------------------------------------------------------------------------
-
-def _text_search(query: str, api_key: str, max_results: int) -> list[dict]:
-    """Runs Text Search (paginated) and returns [{name, place_id, maps_url}]."""
-    results: list[dict] = []
-    params = {"query": query, "key": api_key}
-    page = 0
-
-    while page < MAX_PAGES and len(results) < max_results:
-        page += 1
-        print(f"[maps_scraper_official] Text search page {page}: '{query}'")
-
-        resp = requests.get(TEXT_SEARCH_URL, params=params, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
-
-        status = data.get("status")
-        if status == "ZERO_RESULTS":
-            print("[maps_scraper_official] Zero results — done.")
-            break
-        if status != "OK":
-            raise RuntimeError(f"Places API error: {status} — {data.get('error_message', '')}")
-
-        for place in data.get("results", []):
-            if len(results) >= max_results:
-                break
-            place_id = place.get("place_id")
-            name = place.get("name", "")
-            if not place_id:
+            if not name:
                 continue
-            results.append({
+
+            if not _matches_query(properties, raw, match_terms):
+                continue
+
+            place_lon = properties.get("lon")
+            place_lat = properties.get("lat")
+
+            if place_lon is None or place_lat is None:
+                geometry = feature.get("geometry") or {}
+                coordinates = geometry.get("coordinates") or []
+                if len(coordinates) >= 2:
+                    place_lon, place_lat = coordinates[0], coordinates[1]
+
+            place_id = properties.get("place_id") or ""
+
+            if place_lon is not None and place_lat is not None:
+                maps_url = (
+                    "https://www.google.com/maps/search/?api=1&query="
+                    f"{place_lat},{place_lon}"
+                )
+            else:
+                maps_url = (
+                    "https://www.google.com/maps/search/?api=1&query="
+                    + quote_plus(name)
+                )
+
+            phone = _get_contact(
+                properties, raw, "phone", "telephone"
+            )
+            website = _get_contact(
+                properties, raw, "website", "url"
+            )
+            email = _get_contact(
+                properties, raw, "email"
+            )
+
+            address = (
+                properties.get("formatted")
+                or properties.get("address_line2")
+                or properties.get("address_line1")
+                or ""
+            )
+
+            city = (
+                properties.get("city")
+                or properties.get("county")
+                or location.split(",")[0]
+            )
+
+            categories_found = properties.get("categories") or []
+
+            yield {
+                "_type": "lead",
                 "name": name,
                 "place_id": place_id,
-                # Reconstructed canonical Maps URL (Google doesn't return one
-                # directly from Text Search) — usable as a "view on Maps" link.
-                "maps_url": f"https://www.google.com/maps/place/?q=place_id:{place_id}",
-            })
+                "maps_url": maps_url,
+                "phone": phone,
+                "address": address,
+                "website": website,
+                "rating": properties.get("rating"),
+                "category": _format_category(categories_found)
+                or business_type.title(),
+                "email": email,
+                "city": city,
+            }
 
-        next_token = data.get("next_page_token")
-        if not next_token or page >= MAX_PAGES or len(results) >= max_results:
-            break
+            added += 1
 
-        print("[maps_scraper_official] Waiting before next page…")
-        time.sleep(NEXT_PAGE_SLEEP_SEC)
-        params = {"pagetoken": next_token, "key": api_key}
+        if added == 0:
+            yield {
+                "_type": "progress",
+                "message": (
+                    "No matching businesses found. OpenStreetMap coverage "
+                    "may be limited; try a broader business category or city."
+                ),
+            }
 
-    return results[:max_results]
+        logger.info(
+            "Geoapify scrape complete: query=%r results=%s",
+            query,
+            added,
+        )
+
+    except requests.HTTPError as exc:
+        response = exc.response
+        detail = response.text[:500] if response is not None else str(exc)
+        logger.exception("Geoapify HTTP request failed")
+        yield {
+            "_type": "error",
+            "name": "",
+            "message": f"Geoapify HTTP error: {detail}",
+        }
+
+    except requests.RequestException as exc:
+        logger.exception("Geoapify network request failed")
+        yield {
+            "_type": "error",
+            "name": "",
+            "message": f"Could not connect to Geoapify: {exc}",
+        }
+
+    except Exception as exc:
+        logger.exception("Geoapify scrape failed")
+        yield {
+            "_type": "error",
+            "name": "",
+            "message": str(exc),
+        }
 
 
-def _fetch_detail(place_id: str, api_key: str) -> dict:
-    resp = requests.get(
-        PLACE_DETAILS_URL,
-        params={"place_id": place_id, "fields": DETAIL_FIELDS, "key": api_key},
-        timeout=10,
-    )
-    resp.raise_for_status()
-    data = resp.json()
-
-    if data.get("status") != "OK":
-        raise RuntimeError(f"Details error: {data.get('status')} — {data.get('error_message', '')}")
-
-    r = data.get("result", {})
-    print(f"[maps_scraper_official]   → {r.get('name', '')}")
-
-    return {
-        "phone":    r.get("formatted_phone_number"),
-        "address":  r.get("formatted_address"),
-        "website":  r.get("website"),
-        "rating":   r.get("rating"),
-        "category": _fmt_category(r.get("types", [])),
-        "email":    None,
-        "city":     _extract_city(r.get("formatted_address")),
-    }
-
-
-def _fmt_category(types: list) -> str | None:
-    skip = {"point_of_interest", "establishment", "premise", "locality", "political"}
-    readable = [t.replace("_", " ").title() for t in types if t not in skip]
-    return ", ".join(readable[:3]) if readable else None
-
-
-def _extract_city(address: str | None) -> str | None:
-    """Parse city from a Google-formatted address string.
-    Walks parts from the end (skipping the country), returns the first segment
-    with no digits and length > 3 — skipping postal codes (e.g. '75150',
-    'SW1A 2AA') and state/province abbreviations ('TX', 'ON').
-    """
-    if not address:
-        return None
-    parts = [p.strip() for p in address.split(",") if p.strip()]
-    if len(parts) < 2:
-        return None
-    for part in reversed(parts[:-1]):  # skip last part (country)
-        if any(c.isdigit() for c in part):
-            continue
-        if len(part) <= 3:
-            continue
-        return part
-    return None
+# Keep old imports working.
+scrape_playwright_stream = scrape_official_stream

@@ -63,7 +63,7 @@ AI_lead_generation_system/
 ## Environment Variables (.env)
 ```
 # Google Maps
-GOOGLE_MAPS_API_KEY=your_key_here
+GEOAPIFY_API_KEY=your_key_here
 
 # Groq AI
 GROQ_API_KEY=your_key_here

@@ -101,7 +101,7 @@ def test_email(payload: TestEmailRequest, db: Session = Depends(get_db)):
 @router.post("/test-maps")
 def test_maps(db: Session = Depends(get_db)):
     settings = db.query(Setting).first()
-    api_key = (settings.maps_api_key if settings else None) or os.getenv("GOOGLE_MAPS_API_KEY", "")
+    api_key = (settings.maps_api_key if settings else None) or os.getenv("GEOAPIFY_API_KEY", "")
 
     if not api_key:
         raise HTTPException(status_code=400, detail="Google Maps API key not configured")

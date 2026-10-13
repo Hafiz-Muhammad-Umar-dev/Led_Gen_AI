@@ -647,7 +647,7 @@ async def scrape_leads_stream(
 
         try:
             settings = db.query(Setting).first()
-            api_key  = (settings.maps_api_key if settings else None) or os.getenv("GOOGLE_MAPS_API_KEY", "")
+            api_key  = (settings.maps_api_key if settings else None) or os.getenv("GEOAPIFY_API_KEY", "")
 
             if not api_key:
                 yield f"data: {json.dumps({'type': 'error', 'message': 'Google Maps API key not configured. Add it in Settings.'})}\n\n"
@@ -774,7 +774,7 @@ async def scrape_playwright_leads_stream(
 
             def _scrape_in_thread():
                 try:
-                    api_key = os.getenv("GOOGLE_MAPS_API_KEY", "").strip()
+                    api_key = os.getenv("GEOAPIFY_API_KEY", "").strip()
 
                     for event in scrape_official_stream(
                         query,
@@ -897,7 +897,7 @@ async def scrape_playwright_leads_stream(
 @router.post("/scrape")
 def scrape_leads(payload: ScrapeRequest, db: Session = Depends(get_db), current_user: User = Depends(get_current_user)):
     settings = db.query(Setting).first()
-    api_key  = (settings.maps_api_key if settings else None) or os.getenv("GOOGLE_MAPS_API_KEY", "")
+    api_key  = (settings.maps_api_key if settings else None) or os.getenv("GEOAPIFY_API_KEY", "")
 
     if not api_key:
         raise HTTPException(status_code=400, detail="Google Maps API key not configured. Add it in Settings.")
