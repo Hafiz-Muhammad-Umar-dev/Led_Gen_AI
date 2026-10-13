@@ -38,3 +38,4 @@ aiofiles==25.1.0
 passlib[bcrypt]==1.7.4
 python-jose[cryptography]==3.5.0
 email-validator==2.2.0
+mysql-connector-python
