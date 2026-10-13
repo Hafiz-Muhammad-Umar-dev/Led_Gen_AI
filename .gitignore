@@ -99,3 +99,5 @@ tmp/
 temp/
 *.tmp
 *.temp
+# Frontend's old Git metadata backup
+frontend/.git-backup/
